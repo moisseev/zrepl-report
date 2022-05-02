@@ -1,0 +1,314 @@
+#!/usr/bin/env perl
+
+#========================================================================
+# zrepl report
+#========================================================================
+
+use 5.014;
+use warnings;
+
+use Time::Local;
+use POSIX;
+use Getopt::Long;
+use Pod::Usage;
+
+our ( $opt_a, $opt_f, $opt_l, $opt_o, $opt_s, $opt_w, $opt_help );
+
+GetOptions( "a", "f", "l", "o=f", "s", "w=f", "help|?" )
+  || pod2usage(2);
+pod2usage(1) if ($opt_help);
+
+my $parentfs = shift || pod2usage(2);
+
+-x "/sbin/zfs"
+  or die '/sbin/zfs is not a valid executable.';
+
+my ( $headerPrinted, %snapshots, %foreignSnapshots );
+
+for ( &getFileSystemList($parentfs) ) {
+    my $fs = $_;
+
+    zfsWrittenChk($fs)
+      if $opt_w;
+
+    &getSnapshotList($fs);
+
+    next if $opt_s;
+}
+
+say '' if ($headerPrinted);
+
+&ShowReport;
+
+exit(0);
+
+sub getFileSystemList {
+    my $zfsFS = shift;
+    my $ZFSLIST;
+
+    unless ( defined( open( $ZFSLIST, "-|", "/sbin/zfs list -rpH -t filesystem -o name,usedsnap,usedchild $zfsFS" ) ) )
+    {
+        say STDERR "Can't fork to run 'zfs list' with piped STDOUT.";
+        return;
+    }
+
+    my @filesystems;
+    while (<$ZFSLIST>) {
+        my ( $name, $usedsnap, $usedchild ) = split;
+        next if ( !$usedsnap && $usedchild );
+        push @filesystems, $name;
+    }
+    close $ZFSLIST;
+
+    return @filesystems;
+}
+
+sub getSnapshotList {
+    my $zfsFS = shift;
+
+    my $ZFSLIST;
+
+    unless ( defined( open( $ZFSLIST, "-|", "/sbin/zfs list -rpH -o name,lrefer,written,used -t snapshot $zfsFS" ) ) ) {
+        say STDERR "Can't fork to run 'zfs list' with piped STDOUT.";
+        return;
+    }
+
+    my $i              = 0;
+    my $zfsListValidRE = qr/^(\S+@\S+)\s+(\d+)\s+(\d+)\s+(\d+)$/;
+
+    while (<$ZFSLIST>) {
+        unless (/$zfsListValidRE/) {
+            say "*WARNING* Unexpected 'zfs list' output!", "\n";
+            next;
+        }
+        my %snapshot = (
+            name    => $1,
+            lrefer  => $2,
+            written => $3,
+            used    => $4
+        );
+
+        if (
+            #zroot/vmail@zrepl_20210411_140531_000           1,34M      -  57,3G  -
+            $1 =~ /^([^@]+)@
+            zrepl_
+            (\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_000
+            $/x
+          )
+        {
+            unless ($opt_l) {
+
+                # Time::Local : months start at 0, years have 1900 subtracted
+                my $timeStamp = eval { timegm( $7, $6, $5, $4, $3 - 1, $2 - 1900 ) };
+
+                unless ($timeStamp) {
+                    warn "*WARNING* incorrect timestamp in the snapshot name: $snapshot{name}\n  -> $@\n";
+                    next;
+                }
+                $snapshots{$1}{$timeStamp} = \%snapshot;
+            }
+        }
+        elsif ($opt_l) {
+            $1 =~ /^([^@]+)(@.+)$/;
+            $snapshot{sname} = $2;
+            $foreignSnapshots{$1}[$i] = \%snapshot;
+            $i++;
+        }
+    }
+    close $ZFSLIST;
+}
+
+sub ShowReport {
+    unless ( $opt_l || %snapshots ) {
+        say POSIX::strftime ( '%Y-%m-%d %H:%M', localtime(time) ), "\n";
+        say "*WARNING* No zrepl snapshots found!";
+        return;
+    }
+
+    my $maxPrefixWidth = my $warnOutdated = 0;
+    my @Report;
+
+    my $lastTimeStamp;
+
+    map {
+        my @TimeStamps;
+        my $name = $_;
+
+        $maxPrefixWidth = length if ( length > $maxPrefixWidth );
+
+        unless ($opt_l) {
+            if ($opt_a) {
+                @TimeStamps = ( sort keys %{ $snapshots{$_} } );
+            }
+            else {
+                # [-1] implies the most recent snapshot for each file system.
+                @TimeStamps = ( ( sort keys %{ $snapshots{$_} } )[-1] );
+            }
+
+            for (@TimeStamps) {
+                my $timeStamp = $_;
+                $lastTimeStamp = $timeStamp;
+
+                push @Report,
+                  [
+                    $name,
+                    $snapshots{$name}{$timeStamp}->{lrefer} / 1024**2,
+                    $snapshots{$name}{$timeStamp}->{written} / 1024**2,
+                    $snapshots{$name}{$timeStamp}->{used} / 1024**2,
+                    POSIX::strftime( '%Y-%m-%d %H:%M %z %Z', localtime($timeStamp) ),
+                    floor( ( time - $timeStamp ) / ( 24 * 3600 ) )
+                  ];
+            }
+            unless ( ( time - $lastTimeStamp ) / ( 24 * 3600 * ( $opt_o //= 1 ) ) < 1 ) {
+                $warnOutdated = 1;
+            }
+        }
+
+        if ($opt_l) {
+            for my $foreignSnapshot ( @{ $foreignSnapshots{$name} } ) {
+                push @Report,
+                  [
+                    $name,                                 $foreignSnapshot->{lrefer} / 1024**2,
+                    $foreignSnapshot->{written} / 1024**2, $foreignSnapshot->{used} / 1024**2,
+                    $foreignSnapshot->{sname},             "-"
+                  ];
+            }
+        }
+
+        if ($opt_f) {
+            push @Report,
+              [
+                $name,
+                `/sbin/zfs get -Hp -o value lrefer $name` / 1024**2,
+                `/sbin/zfs get -Hp -o value written $name` / 1024**2,
+                `/sbin/zfs get -Hp -o value usedds $name` / 1024**2,
+                "Filesystem", "-"
+              ];
+
+            push @Report,
+              [
+                $name,
+                `/sbin/zfs get -Hp -o value lused $name` / 1024**2,
+                `/sbin/zfs get -Hp -o value written $name` / 1024**2,
+                `/sbin/zfs get -Hp -o value used $name` / 1024**2,
+                "Filesystem and descendents",
+                "-"
+              ];
+        }
+
+        # Print a horizontal line;
+        push @Report, []
+          if ( $opt_a || $opt_l || $opt_f );
+
+    } sort ( ($opt_l) ? keys %foreignSnapshots : keys %snapshots );
+
+    !$opt_s || $warnOutdated || return;
+
+    # Print report header and table header
+
+    say POSIX::strftime ( '%Y-%m-%d %H:%M', localtime(time) ), "\n";
+    say "Number of file systems: ", scalar( keys %snapshots ), "\n";
+
+    say "*WARNING* Some snapshots are outdated!", "\n" if $warnOutdated;
+
+    printf "%-${maxPrefixWidth}s | %9s | %12s | %9s | %-26s | %8s\n",
+      "File system", "Size (MB)", "Written (MB)", "Used (MB)",
+      ($opt_l) ? "Snapshot name" : "Created", "Days old";
+
+    &printHorizontalLine($maxPrefixWidth);
+
+    # Print rest of the table
+    for my $reportRow (@Report) {
+        unless (@$reportRow) {
+            &printHorizontalLine($maxPrefixWidth);
+            next;
+        }
+        printf
+          "%-${maxPrefixWidth}s | %9.2f | %12.2f | %9.2f | %-26s | %8s\n",
+          @$reportRow;
+    }
+}
+
+sub printHorizontalLine {
+    my $maxPrefixWidth = shift;
+    my $i              = $maxPrefixWidth + 79;
+    while ( $i-- ) { print "-" }
+    say '';
+}
+
+sub zfsWrittenChk {
+    my $zfsFS = shift;
+    return 1
+      if ( `/sbin/zfs get -Hp -o value written $zfsFS` >= 1048576 * $opt_w );
+
+    say "*WARNING* Less than ${opt_w}M has been written to $zfsFS since the most recent snapshot.", "\n";
+    return 0;
+}
+
+__END__
+
+
+=head1 NAME
+
+zrepl-report - reporting tool for L<zrepl|https://zrepl.github.io>
+
+=head1 SYNOPSIS
+
+B<zrepl-report> [-a] [-f] [-s] [-o F<interval>] [-w F<amount>] F<file system>
+
+B<zrepl-report --help|-?>
+
+ Options:
+       -a               include all zrepl snapshots in the report
+       -f               include filesystem statistics in the report
+       -l               list foreign snapshots
+       -o               outdated snapshot warning interval, days, floating (default: 1)
+       -s               suppress report if no warnings
+       -w               written warning threshold, MiB, floating (default: 1MiB)
+
+       --help -?        brief help message
+
+=head1 OPTIONS
+
+=over
+
+=item  B<-a>
+
+Include all available zrepl snapshots in the report. The default is the most
+recent snapshots only.
+
+=item  B<-f>
+
+Include file system statistics in the report. The default is snapshots
+statistics only.
+
+=item  B<-l>
+
+List all non-zrepl snapshots.
+
+=item  B<-o> I<warning_interval>
+
+Specify outdated snapshot warning interval in hours (floating). The default is
+1 hour. If time stamp of the most recent snapshot for a file system is older
+than specified I<interval> then a warning message will be prepended to the
+report header.
+
+=item  B<-s>
+
+Suppress output if there are no warnings. Useful for crontab jobs in
+conjunction with B<mail -E>.
+
+=item  B<-w> I<amount>
+
+Specify written warning threshold in mebibytes (floating). The default is 1
+MiB. If less than specified I<amount> of data has been written to the file
+system since the most recent snapshot then a warning message will be prepended
+to the report header.
+
+=item B<--help -?>
+
+Brief help.
+
+=back
+
+=cut
