@@ -264,7 +264,7 @@ B<zrepl-report --help|-?>
        -l               list foreign snapshots
        -o               outdated snapshot warning interval, days, floating (default: 1)
        -s               suppress report if no warnings
-       -w               written warning threshold, MiB, floating (default: 1MiB)
+       -w               written warning threshold, MiB, floating (default: unset)
 
        --help -?        brief help message
 
@@ -300,8 +300,8 @@ conjunction with B<mail -E>.
 
 =item  B<-w> I<amount>
 
-Specify written warning threshold in mebibytes (floating). The default is 1
-MiB. If less than specified I<amount> of data has been written to the file
+Specify written warning threshold in mebibytes (floating). The default is
+unset. If less than specified I<amount> of data has been written to the file
 system since the most recent snapshot then a warning message will be prepended
 to the report header.
 
